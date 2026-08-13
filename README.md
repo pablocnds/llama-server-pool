@@ -23,7 +23,8 @@ LLAMA_POOL_LLAMA_SERVER_EXECUTABLE=/path/to/llama-server \
 ```
 
 The manager binds to `127.0.0.1:8080` by default. Interactive API documentation
-is available at `/docs` while it is running.
+is available at `/docs` while it is running. The optional monitoring and control
+panel is available at <http://127.0.0.1:8080/ui/>.
 
 Register and initialize a model:
 
@@ -62,6 +63,7 @@ unloaded registered model starts it automatically.
 | `PATCH` | `/control/models/{id}` | Change priority with `{"priority": 10}` |
 | `DELETE` | `/control/models/{id}` | Stop and remove the registration |
 | `GET` | `/control/stats` | Get system, pool, and per-process memory data |
+| `GET` | `/control/model-files` | List GGUF files inside the optional discovery root |
 | `GET` | `/v1/models` | List all registered stable model IDs |
 | `POST` | `/v1/chat/completions` | Proxy an OpenAI-compatible request |
 
@@ -75,6 +77,31 @@ The pool owns the llama-server `--model`, `--alias`, `--host`, `--port`,
 `--api-key`, and `--api-key-file` options. Supplying any of those through
 registration arguments is rejected. Duplicate registrations with the same
 resolved model path and exact argument list return HTTP 409.
+
+## Monitoring and control panel
+
+The lightweight browser panel at `/ui/` is enabled by default. It is a static,
+same-origin client of the documented pool API and has no privileged backend
+access or separate state. It provides:
+
+- An additive physical-memory bar with a segment for each loaded profile,
+  outside-pool resident/cache memory, pool-budget and headroom markers
+- Live profile status, PSS/RSS usage, active request counts, priority, and
+  last-used time
+- Load, force-load, unload, and unregister controls
+- Profile creation using discovered or already-registered model files
+- Ephemeral streaming chats kept only in the current browser tab
+
+Set `LLAMA_POOL_MODEL_DISCOVERY_ROOT` to allow the creation form to list GGUF
+files recursively beneath one directory. Resolved files must remain inside that
+root, so symlinks cannot expose files elsewhere. The UI deliberately has no
+free-form model-path field. Without a discovery root, it can only create another
+configuration using a model file already referenced by a registered profile.
+
+The panel has exactly the same access as the API. It shows a warning when opened
+through a non-loopback hostname because this MVP does not yet provide
+authentication. Disabling the panel removes `/ui` but does not disable or alter
+any control endpoint.
 
 ## Configuration
 
@@ -95,6 +122,8 @@ Configuration uses environment variables. Byte values are integer byte counts.
 | `LLAMA_POOL_STARTUP_TIMEOUT_SECONDS` | `300` |
 | `LLAMA_POOL_SHUTDOWN_TIMEOUT_SECONDS` | `10` |
 | `LLAMA_POOL_LOG_LEVEL` | `INFO` |
+| `LLAMA_POOL_UI_ENABLED` | `true` |
+| `LLAMA_POOL_MODEL_DISCOVERY_ROOT` | unset (discovery disabled) |
 
 Set the log level to `DEBUG` to record each model's predicted memory and its
 measured PSS (or RSS fallback) immediately after initialization.

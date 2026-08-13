@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>llama-server pool</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="shell topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">λ</span>
+        <div>
+          <h1>llama-server pool</h1>
+          <p>Local model control room</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="connection-status" class="connection"><i></i> Connecting</span>
+        <button id="refresh-button" class="button button-quiet" type="button">Refresh</button>
+        <button id="new-profile-button" class="button button-primary" type="button">New profile</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <aside id="network-warning" class="notice warning hidden" role="alert">
+        <strong>Unauthenticated remote access</strong>
+        <span>This panel has the same control access as the API. Anyone who can reach this address can manage models.</span>
+      </aside>
+
+      <section class="overview" aria-labelledby="memory-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">System overview</p>
+            <h2 id="memory-heading">Memory</h2>
+          </div>
+          <p id="last-updated" class="muted">Waiting for data…</p>
+        </div>
+
+        <div class="metric-grid">
+          <article class="metric">
+            <span>Available</span>
+            <strong id="available-memory">—</strong>
+            <small id="available-percent">—</small>
+          </article>
+          <article class="metric">
+            <span>Pool usage</span>
+            <strong id="pool-usage">—</strong>
+            <small id="pool-budget">Unlimited budget</small>
+          </article>
+          <article class="metric">
+            <span>Loaded profiles</span>
+            <strong id="running-count">—</strong>
+            <small id="registered-count">— registered</small>
+          </article>
+          <article class="metric">
+            <span>Active requests</span>
+            <strong id="active-count">—</strong>
+            <small id="starting-count">— starting</small>
+          </article>
+        </div>
+
+        <div class="memory-panel">
+          <div id="memory-bar" class="memory-bar" role="img" aria-label="System memory distribution">
+            <div id="model-segments" class="model-segments"></div>
+            <div id="memory-free" class="memory-free"></div>
+            <div id="memory-other" class="memory-other"></div>
+            <div id="budget-marker" class="bar-marker budget-marker hidden"><span>Pool budget</span></div>
+            <div id="normal-marker" class="bar-marker normal-marker"><span>Normal headroom</span></div>
+            <div id="critical-marker" class="bar-marker critical-marker"><span>Critical</span></div>
+          </div>
+          <div id="memory-legend" class="memory-legend"></div>
+          <p class="memory-note">
+            Model segments use proportional set size (PSS), with RSS fallback. Available memory includes reclaimable cache and may overlap resident model pages.
+          </p>
+        </div>
+      </section>
+
+      <section class="profiles" aria-labelledby="profiles-heading">
+        <div class="section-heading profile-heading">
+          <div>
+            <p class="eyebrow">Residency and controls</p>
+            <h2 id="profiles-heading">Profiles</h2>
+          </div>
+          <label class="filter-field">
+            <span class="sr-only">Filter profiles</span>
+            <input id="profile-filter" type="search" placeholder="Filter profiles…" autocomplete="off">
+          </label>
+        </div>
+        <div id="profile-list" class="profile-list" aria-live="polite">
+          <div class="empty-state">Loading profiles…</div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="profile-dialog" class="modal">
+      <form id="profile-form" method="dialog">
+        <header class="modal-header">
+          <div>
+            <p class="eyebrow">Registration</p>
+            <h2>Create profile</h2>
+          </div>
+          <button class="icon-button" type="button" aria-label="Close" data-close-dialog="profile-dialog">×</button>
+        </header>
+
+        <div id="discovery-warning" class="notice warning hidden">
+          Model discovery is not configured. New profiles can only reuse a model file already referenced by another profile.
+        </div>
+
+        <div class="form-grid">
+          <label>
+            <span>Profile ID</span>
+            <input id="profile-id" name="id" required maxlength="256" pattern="[A-Za-z0-9._:-]+" placeholder="qwen-16k">
+            <small>Stable API model ID</small>
+          </label>
+          <label>
+            <span>Model file</span>
+            <select id="model-path" name="model_path" required></select>
+            <small id="model-path-help">Choose a discovered GGUF file</small>
+          </label>
+          <label>
+            <span>Priority</span>
+            <input id="profile-priority" name="priority" type="number" value="0" step="1" required>
+            <small>Lower values are evicted first</small>
+          </label>
+          <label>
+            <span>Memory estimate override</span>
+            <input id="memory-estimate" name="estimated_memory_bytes" type="number" min="1" step="1" placeholder="Automatic">
+            <small>Optional, in bytes</small>
+          </label>
+        </div>
+
+        <fieldset class="arguments-fieldset">
+          <div class="fieldset-heading">
+            <div>
+              <legend>llama-server arguments</legend>
+              <small>The pool-owned host, port, model, alias, and API-key flags are not allowed.</small>
+            </div>
+            <label class="switch-label">
+              <input id="raw-args-toggle" type="checkbox">
+              <span>Raw JSON array</span>
+            </label>
+          </div>
+          <div id="argument-editor">
+            <div id="argument-rows" class="argument-rows"></div>
+            <button id="add-argument" class="button button-quiet button-small" type="button">Add argument</button>
+          </div>
+          <label id="raw-arguments-field" class="hidden">
+            <span class="sr-only">Raw argument array</span>
+            <textarea id="raw-arguments" rows="5" spellcheck="false" placeholder='["--ctx-size", "16000", "--temp", "1.0"]'></textarea>
+          </label>
+        </fieldset>
+
+        <label class="checkbox-row">
+          <input id="initialize-profile" name="initialize" type="checkbox">
+          <span>Load this profile immediately</span>
+        </label>
+
+        <p id="profile-form-error" class="form-error hidden" role="alert"></p>
+        <footer class="modal-actions">
+          <button class="button button-quiet" value="cancel" type="button" data-close-dialog="profile-dialog">Cancel</button>
+          <button id="create-profile-submit" class="button button-primary" type="submit">Create profile</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="chat-dialog" class="modal chat-modal">
+      <div class="chat-layout">
+        <header class="modal-header">
+          <div>
+            <p class="eyebrow">Ephemeral chat</p>
+            <h2 id="chat-title">Chat</h2>
+          </div>
+          <button class="icon-button" type="button" aria-label="Close" data-close-dialog="chat-dialog">×</button>
+        </header>
+        <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+        <form id="chat-form" class="chat-composer">
+          <textarea id="chat-input" rows="3" required placeholder="Send a test message…"></textarea>
+          <div class="chat-controls">
+            <small>Conversation exists only in this browser tab.</small>
+            <div>
+              <button id="clear-chat" class="button button-quiet button-small" type="button">Clear</button>
+              <button id="stop-chat" class="button button-danger button-small hidden" type="button">Stop</button>
+              <button id="send-chat" class="button button-primary" type="submit">Send</button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

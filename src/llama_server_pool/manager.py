@@ -324,6 +324,21 @@ class PoolManager:
                 total_bytes=system.total_bytes,
                 available_bytes=system.available_bytes,
                 used_bytes=system.used_bytes,
+                free_bytes=(
+                    system.free_bytes
+                    if system.free_bytes is not None
+                    else system.available_bytes
+                ),
+                outside_pool_resident_bytes=max(
+                    0,
+                    system.total_bytes
+                    - (
+                        system.free_bytes
+                        if system.free_bytes is not None
+                        else system.available_bytes
+                    )
+                    - usage,
+                ),
                 normal_headroom_bytes=self.settings.normal_headroom_bytes,
                 critical_headroom_bytes=self.settings.critical_headroom_bytes,
             ),
@@ -473,7 +488,9 @@ class PoolManager:
                 raise _StartInterrupted(
                     f"initialization of model {record.id!r} was interrupted"
                 )
-        api_key = secrets.token_urlsafe(32)
+        # The prefix prevents a leading '-' from being interpreted as another
+        # command-line option by llama-server's argument parser.
+        api_key = f"pool_{secrets.token_urlsafe(32)}"
         command = [
             self.settings.llama_server_executable,
             "--model",

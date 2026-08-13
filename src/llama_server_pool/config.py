@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 GIB = 1024**3
 MIB = 1024**2
@@ -15,6 +16,18 @@ def _env_int(name: str, default: int) -> int:
 def _env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     return default if value is None else float(value)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +45,8 @@ class Settings:
     startup_timeout_seconds: float = 300.0
     shutdown_timeout_seconds: float = 10.0
     log_level: str = "INFO"
+    ui_enabled: bool = True
+    model_discovery_root: str | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.port <= 65_535:
@@ -56,6 +71,14 @@ class Settings:
             raise ValueError("monitor interval must be positive")
         if self.startup_timeout_seconds <= 0 or self.shutdown_timeout_seconds <= 0:
             raise ValueError("timeouts must be positive")
+        if self.model_discovery_root is not None:
+            try:
+                root = Path(self.model_discovery_root).expanduser().resolve(strict=True)
+            except OSError as exc:
+                raise ValueError("model discovery root cannot be accessed") from exc
+            if not root.is_dir():
+                raise ValueError("model discovery root must be a directory")
+            object.__setattr__(self, "model_discovery_root", str(root))
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -86,4 +109,6 @@ class Settings:
                 "LLAMA_POOL_SHUTDOWN_TIMEOUT_SECONDS", 10.0
             ),
             log_level=os.getenv("LLAMA_POOL_LOG_LEVEL", "INFO"),
+            ui_enabled=_env_bool("LLAMA_POOL_UI_ENABLED", True),
+            model_discovery_root=os.getenv("LLAMA_POOL_MODEL_DISCOVERY_ROOT") or None,
         )

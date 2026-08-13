@@ -57,6 +57,8 @@ class SystemMemoryView(BaseModel):
     total_bytes: int
     available_bytes: int
     used_bytes: int
+    free_bytes: int
+    outside_pool_resident_bytes: int
     normal_headroom_bytes: int
     critical_headroom_bytes: int
 
@@ -70,3 +72,15 @@ class PoolStatsView(BaseModel):
     starting_models: int
     active_requests: int
     processes: list[ModelView]
+
+
+class DiscoveredModelView(BaseModel):
+    path: str
+    name: str
+    relative_path: str
+    size_bytes: int
+
+
+class ModelDiscoveryView(BaseModel):
+    enabled: bool
+    models: list[DiscoveredModelView]

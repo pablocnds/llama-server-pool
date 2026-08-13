@@ -6,17 +6,26 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
 
 from .config import Settings
 from .errors import PoolError
 from .manager import PoolManager, RouteLease
 from .models import (
+    DiscoveredModelView,
+    ModelDiscoveryView,
     ModelView,
     PoolStatsView,
     RegisterModelRequest,
@@ -119,6 +128,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def pool_stats(request: Request) -> PoolStatsView:
         return await _manager(request).stats()
 
+    @app.get("/control/model-files", response_model=ModelDiscoveryView)
+    async def discover_model_files() -> ModelDiscoveryView:
+        if configured.model_discovery_root is None:
+            return ModelDiscoveryView(enabled=False, models=[])
+        models = await asyncio.to_thread(
+            _discover_models, Path(configured.model_discovery_root)
+        )
+        return ModelDiscoveryView(enabled=True, models=models)
+
     @app.get("/v1/models")
     async def openai_models(request: Request) -> dict[str, Any]:
         models = await _manager(request).list_models()
@@ -208,6 +226,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers=response_headers,
         )
 
+    if configured.ui_enabled:
+        static_directory = Path(__file__).with_name("static")
+
+        @app.get("/ui", include_in_schema=False)
+        async def ui_redirect() -> RedirectResponse:
+            return RedirectResponse("/ui/", status_code=307)
+
+        app.mount(
+            "/ui",
+            StaticFiles(directory=static_directory, html=True),
+            name="ui",
+        )
+
     return app
 
 
@@ -260,3 +291,31 @@ def _error_response(status_code: int, message: str, code: str) -> JSONResponse:
             }
         },
     )
+
+
+def _discover_models(root: Path) -> list[DiscoveredModelView]:
+    root = root.resolve(strict=True)
+    discovered: list[DiscoveredModelView] = []
+    seen: set[Path] = set()
+    for candidate in root.rglob("*"):
+        if candidate.suffix.lower() != ".gguf":
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_file() or not resolved.is_relative_to(root):
+                continue
+            size = resolved.stat().st_size
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        discovered.append(
+            DiscoveredModelView(
+                path=str(resolved),
+                name=resolved.name,
+                relative_path=str(resolved.relative_to(root)),
+                size_bytes=size,
+            )
+        )
+    return sorted(discovered, key=lambda item: item.relative_path.casefold())

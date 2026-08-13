@@ -199,3 +199,23 @@ async def test_an_occupied_internal_port_is_skipped(model_file: Path) -> None:
     finally:
         await manager.shutdown()
         occupied.close()
+
+
+@pytest.mark.asyncio
+async def test_generated_api_key_cannot_be_parsed_as_an_option(
+    model_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "llama_server_pool.manager.secrets.token_urlsafe", lambda _size: "-leading"
+    )
+    manager = PoolManager(manager_settings(), memory_reader=FixedMemoryReader())
+    await manager.start()
+    try:
+        await manager.register(
+            RegisterModelRequest(id="model", model_path=str(model_file))
+        )
+        lease = await manager.acquire_route("model")
+        assert lease.api_key == "pool_-leading"
+        await lease.release()
+    finally:
+        await manager.shutdown()

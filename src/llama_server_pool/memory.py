@@ -11,6 +11,7 @@ class SystemMemory:
     total_bytes: int
     available_bytes: int
     used_bytes: int
+    free_bytes: int | None = None
 
 
 class MemoryReader:
@@ -27,6 +28,7 @@ class MemoryReader:
             total_bytes=memory.total,
             available_bytes=memory.available,
             used_bytes=memory.total - memory.available,
+            free_bytes=memory.free,
         )
 
     @staticmethod
