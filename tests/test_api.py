@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from starlette.responses import Response
+
+from llama_server_pool.app import _append_response_headers, _filtered_headers
 
 
 @pytest.mark.asyncio
@@ -122,3 +125,24 @@ async def test_remove_and_missing_model_errors(
         "/v1/chat/completions", json={"model": "temporary", "messages": []}
     )
     assert missing.status_code == 404
+
+
+def test_proxy_header_filtering_is_connection_aware_and_preserves_duplicates() -> None:
+    headers = [
+        ("Connection", "close, X-Private"),
+        ("X-Private", "remove me"),
+        ("Trailer", "Expires"),
+        ("Set-Cookie", "first=1"),
+        ("Set-Cookie", "second=2"),
+        ("X-Public", "keep me"),
+    ]
+
+    filtered = _filtered_headers(headers, {"connection", "trailer"})
+    response = _append_response_headers(Response(), filtered)
+
+    assert filtered == [
+        ("Set-Cookie", "first=1"),
+        ("Set-Cookie", "second=2"),
+        ("X-Public", "keep me"),
+    ]
+    assert response.headers.getlist("set-cookie") == ["first=1", "second=2"]

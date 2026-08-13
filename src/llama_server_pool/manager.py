@@ -35,6 +35,7 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 _FORBIDDEN_ARGUMENTS = {
+    "-a",
     "-m",
     "--model",
     "--alias",
@@ -44,6 +45,14 @@ _FORBIDDEN_ARGUMENTS = {
     "--api-key-file",
 }
 _FORBIDDEN_PREFIXES = tuple(f"{argument}=" for argument in _FORBIDDEN_ARGUMENTS)
+_CONTROLLED_ENVIRONMENT = {
+    "LLAMA_ARG_ALIAS",
+    "LLAMA_ARG_API_KEY_FILE",
+    "LLAMA_ARG_HOST",
+    "LLAMA_ARG_MODEL",
+    "LLAMA_ARG_PORT",
+    "LLAMA_API_KEY",
+}
 
 
 @dataclass(slots=True)
@@ -68,6 +77,7 @@ class ModelRecord:
     last_error: str | None = None
     watcher: asyncio.Task[None] | None = None
     output_tasks: tuple[asyncio.Task[None], ...] = ()
+    stop_task: asyncio.Task[None] | None = None
 
     @property
     def identity(self) -> tuple[str, tuple[str, ...]]:
@@ -77,12 +87,13 @@ class ModelRecord:
 @dataclass(frozen=True, slots=True)
 class RouteLease:
     manager: PoolManager
+    record: ModelRecord = field(repr=False)
     model_id: str
     port: int
     api_key: str
 
     async def release(self) -> None:
-        await self.manager.release_route(self.model_id)
+        await self.manager.release_route(self.record)
 
 
 class _StartupAttemptError(Exception):
@@ -220,6 +231,15 @@ class PoolManager:
         return self._view(record)
 
     async def start_model(self, model_id: str, *, force: bool = False) -> ModelView:
+        async with self._condition:
+            if self._closing:
+                raise PoolShuttingDownError("the pool is shutting down")
+            record = self._records.get(model_id)
+            if record is None:
+                raise ModelNotFoundError(f"model {model_id!r} is not registered")
+            if record.status is ModelStatus.RUNNING and record.process is not None:
+                return self._view(record)
+
         async with self._initialization_lock:
             while True:
                 async with self._condition:
@@ -274,32 +294,38 @@ class PoolManager:
 
     async def acquire_route(self, model_id: str) -> RouteLease:
         while True:
+            lease = await self._lease_running_route(model_id)
+            if lease is not None:
+                return lease
             await self.start_model(model_id)
-            async with self._condition:
-                record = self._records.get(model_id)
-                if record is None:
-                    raise ModelNotFoundError(f"model {model_id!r} is not registered")
-                if (
-                    record.status is ModelStatus.RUNNING
-                    and record.process is not None
-                    and record.internal_port is not None
-                    and record.api_key is not None
-                ):
-                    record.active_requests += 1
-                    return RouteLease(
-                        manager=self,
-                        model_id=model_id,
-                        port=record.internal_port,
-                        api_key=record.api_key,
-                    )
 
-    async def release_route(self, model_id: str) -> None:
+    async def _lease_running_route(self, model_id: str) -> RouteLease | None:
         async with self._condition:
             record = self._records.get(model_id)
-            if record is not None:
-                record.active_requests = max(0, record.active_requests - 1)
+            if record is None:
+                raise ModelNotFoundError(f"model {model_id!r} is not registered")
+            if (
+                record.status is not ModelStatus.RUNNING
+                or record.process is None
+                or record.internal_port is None
+                or record.api_key is None
+            ):
+                return None
+            record.active_requests += 1
+            return RouteLease(
+                manager=self,
+                record=record,
+                model_id=model_id,
+                port=record.internal_port,
+                api_key=record.api_key,
+            )
+
+    async def release_route(self, record: ModelRecord) -> None:
+        async with self._condition:
+            record.active_requests = max(0, record.active_requests - 1)
+            if self._records.get(record.id) is record:
                 record.last_used_at = time.time()
-            self._condition.notify_all()
+                self._condition.notify_all()
 
     async def get_model(
         self, model_id: str, *, refresh_memory: bool = False
@@ -388,7 +414,7 @@ class PoolManager:
             if self._has_capacity(system, usage, prediction):
                 return
 
-            victim = await self._choose_victim(
+            victim = await self._reserve_victim(
                 exclude_id=target.id,
                 include_active=force,
                 include_starting=force,
@@ -426,7 +452,7 @@ class PoolManager:
         budget = self.settings.pool_memory_budget_bytes
         return budget is None or pool_usage + prediction <= budget
 
-    async def _choose_victim(
+    async def _reserve_victim(
         self,
         *,
         exclude_id: str | None = None,
@@ -459,7 +485,11 @@ class PoolManager:
                     record.last_used_at if record.last_used_at is not None else 0.0,
                 )
 
-            return min(candidates, key=eviction_key, default=None)
+            victim = min(candidates, key=eviction_key, default=None)
+            if victim is not None:
+                victim.status = ModelStatus.STOPPING
+                self._condition.notify_all()
+            return victim
 
     async def _spawn_with_port_retries(self, record: ModelRecord) -> None:
         attempts = self.settings.internal_port_max - self.settings.internal_port_min + 1
@@ -511,12 +541,16 @@ class PoolManager:
             "--api-key",
             api_key,
         ]
+        environment = os.environ.copy()
+        for name in _CONTROLLED_ENVIRONMENT:
+            environment.pop(name, None)
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=environment,
             )
         except OSError as exc:
             async with self._condition:
@@ -656,11 +690,26 @@ class PoolManager:
                     record.status = ModelStatus.REGISTERED
                     self._condition.notify_all()
                 return
-            if record.status is not ModelStatus.STOPPING:
-                record.status = ModelStatus.STOPPING
-                self._condition.notify_all()
-            port = record.internal_port
+            task = record.stop_task
+            if task is None:
+                if record.status is not ModelStatus.STOPPING:
+                    record.status = ModelStatus.STOPPING
+                    self._condition.notify_all()
+                port = record.internal_port
+                task = asyncio.create_task(
+                    self._finish_stop(record, process, port, reason),
+                    name=f"{record.id}-stopper",
+                )
+                record.stop_task = task
+        await asyncio.shield(task)
 
+    async def _finish_stop(
+        self,
+        record: ModelRecord,
+        process: asyncio.subprocess.Process,
+        port: int | None,
+        reason: str,
+    ) -> None:
         logger.info("stopping model %s (pid %d): %s", record.id, process.pid, reason)
         await self._terminate_process(process)
 
@@ -677,27 +726,50 @@ class PoolManager:
                 record.gpu_shared_memory_bytes = None
                 record.gpu_dedicated_memory_bytes = None
                 record.status = ModelStatus.REGISTERED
+            if record.stop_task is asyncio.current_task():
+                record.stop_task = None
             if port is not None:
                 self._ports_in_use.discard(port)
             self._condition.notify_all()
 
     async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
+        process_group = process.pid
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(process.wait()),
-                timeout=self.settings.shutdown_timeout_seconds,
-            )
-        except TimeoutError:
+            os.killpg(process_group, signal.SIGTERM)
+        deadline = (
+            asyncio.get_running_loop().time() + self.settings.shutdown_timeout_seconds
+        )
+        while self._process_group_exists(process_group):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            if process.returncode is None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(process.wait()), timeout=min(0.05, remaining)
+                    )
+                except TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(min(0.05, remaining))
+        if self._process_group_exists(process_group):
             logger.warning(
-                "process group %d did not stop; sending SIGKILL", process.pid
+                "process group %d did not stop; sending SIGKILL", process_group
             )
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process_group, signal.SIGKILL)
+        if process.returncode is None:
             await process.wait()
+
+    @staticmethod
+    def _process_group_exists(process_group: int) -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     async def _watch_process(
         self, record: ModelRecord, process: asyncio.subprocess.Process, port: int
@@ -709,9 +781,15 @@ class PoolManager:
             if record.status is ModelStatus.STOPPING:
                 self._condition.notify_all()
                 return
+        await self._terminate_process(process)
+        async with self._condition:
+            if record.process is not process:
+                return
             record.process = None
             record.internal_port = None
             record.api_key = None
+            record.watcher = None
+            record.output_tasks = ()
             record.actual_memory_bytes = None
             record.process_memory_bytes = None
             record.process_file_memory_bytes = None
@@ -774,9 +852,9 @@ class PoolManager:
                 usage,
             )
 
-        allow_busy = critical
         while pressured or over_budget:
-            victim = await self._choose_victim(
+            allow_busy = system.available_bytes < self.settings.critical_headroom_bytes
+            victim = await self._reserve_victim(
                 include_active=allow_busy,
                 include_starting=allow_busy,
             )
@@ -868,7 +946,10 @@ class PoolManager:
         for argument in args:
             if "\x00" in argument:
                 raise ValueError("llama-server arguments cannot contain NUL bytes")
-            if argument in _FORBIDDEN_ARGUMENTS or argument.startswith(
+            normalized = (
+                argument.replace("_", "-") if argument.startswith("--") else argument
+            )
+            if normalized in _FORBIDDEN_ARGUMENTS or normalized.startswith(
                 _FORBIDDEN_PREFIXES
             ):
                 raise ValueError(

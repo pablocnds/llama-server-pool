@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -40,7 +40,9 @@ _HOP_BY_HOP_HEADERS = {
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
+    "trailer",
     "trailers",
     "transfer-encoding",
     "upgrade",
@@ -172,12 +174,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request, manager.acquire_route(body["model"])
         )
         proxy_client: httpx.AsyncClient = request.app.state.proxy_client
-        headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() not in _REQUEST_HEADERS_TO_DROP
-        }
-        headers["Authorization"] = f"Bearer {lease.api_key}"
+        headers = _filtered_headers(
+            (
+                (key.decode("latin-1"), value.decode("latin-1"))
+                for key, value in request.headers.raw
+            ),
+            _REQUEST_HEADERS_TO_DROP,
+        )
+        headers.append(("Authorization", f"Bearer {lease.api_key}"))
         upstream_request = proxy_client.build_request(
             "POST",
             f"http://127.0.0.1:{lease.port}/v1/chat/completions",
@@ -195,17 +199,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 502, "the model server is unavailable", "upstream_error"
             )
 
-        response_headers = {
-            key: value
-            for key, value in upstream.headers.items()
-            if key.lower() not in _RESPONSE_HEADERS_TO_DROP
-        }
+        response_headers = _filtered_headers(
+            upstream.headers.multi_items(), _RESPONSE_HEADERS_TO_DROP
+        )
         if body.get("stream") is True:
-            return StreamingResponse(
-                _stream_upstream(upstream, lease),
-                status_code=upstream.status_code,
-                headers=response_headers,
-                media_type=None,
+            return _append_response_headers(
+                StreamingResponse(
+                    _stream_upstream(upstream, lease),
+                    status_code=upstream.status_code,
+                    media_type=None,
+                ),
+                response_headers,
             )
 
         try:
@@ -220,10 +224,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await upstream.aclose()
             await lease.release()
-        return Response(
-            content=content,
-            status_code=upstream.status_code,
-            headers=response_headers,
+        return _append_response_headers(
+            Response(content=content, status_code=upstream.status_code),
+            response_headers,
         )
 
     if configured.ui_enabled:
@@ -291,6 +294,31 @@ def _error_response(status_code: int, message: str, code: str) -> JSONResponse:
             }
         },
     )
+
+
+def _filtered_headers(
+    headers: Iterable[tuple[str, str]], excluded: set[str]
+) -> list[tuple[str, str]]:
+    items = list(headers)
+    connection_options = {
+        option.strip().lower()
+        for key, value in items
+        if key.lower() == "connection"
+        for option in value.split(",")
+        if option.strip()
+    }
+    blocked = excluded | connection_options
+    return [(key, value) for key, value in items if key.lower() not in blocked]
+
+
+def _append_response_headers[T: Response](
+    response: T, headers: Iterable[tuple[str, str]]
+) -> T:
+    response.raw_headers.extend(
+        (key.lower().encode("latin-1"), value.encode("latin-1"))
+        for key, value in headers
+    )
+    return response
 
 
 def _discover_models(root: Path) -> list[DiscoveredModelView]:
