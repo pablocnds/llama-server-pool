@@ -10,24 +10,47 @@ import pytest
 from llama_server_pool.config import Settings
 from llama_server_pool.errors import ModelConflictError
 from llama_server_pool.manager import PoolManager
-from llama_server_pool.memory import SystemMemory
+from llama_server_pool.memory import ProcessMemory, SystemMemory
 from llama_server_pool.models import RegisterModelRequest
 
 
 class FixedMemoryReader:
-    def __init__(self, *, available: int = 10_000, process_usage: int = 100) -> None:
+    def __init__(
+        self,
+        *,
+        available: int = 10_000,
+        free: int | None = None,
+        cached: int = 0,
+        process_usage: int = 100,
+        process_file_usage: int = 0,
+        drm_system_usage: int = 0,
+        drm_vram_usage: int = 0,
+    ) -> None:
         self.available = available
+        self.free = free
+        self.cached = cached
         self.process_usage = process_usage
+        self.process_file_usage = process_file_usage
+        self.drm_system_usage = drm_system_usage
+        self.drm_vram_usage = drm_vram_usage
 
     async def system(self) -> SystemMemory:
         return SystemMemory(
             total_bytes=10_000,
             available_bytes=self.available,
             used_bytes=10_000 - self.available,
+            free_bytes=self.free,
+            cached_bytes=self.cached,
         )
 
-    async def process(self, _pid: int) -> int:
-        return self.process_usage
+    async def process(self, _pid: int) -> ProcessMemory:
+        return ProcessMemory(
+            process_bytes=self.process_usage,
+            process_anon_bytes=self.process_usage - self.process_file_usage,
+            process_file_bytes=self.process_file_usage,
+            drm_system_bytes=self.drm_system_usage,
+            drm_vram_bytes=self.drm_vram_usage,
+        )
 
 
 def manager_settings(*, budget: int | None = None) -> Settings:
@@ -217,5 +240,47 @@ async def test_generated_api_key_cannot_be_parsed_as_an_option(
         lease = await manager.acquire_route("model")
         assert lease.api_key == "pool_-leading"
         await lease.release()
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stats_charge_drm_system_memory_and_separate_cache(
+    model_file: Path,
+) -> None:
+    memory = FixedMemoryReader(
+        available=7_000,
+        free=4_000,
+        cached=3_000,
+        process_usage=1_000,
+        process_file_usage=400,
+        drm_system_usage=2_000,
+        drm_vram_usage=500,
+    )
+    manager = PoolManager(manager_settings(), memory_reader=memory)
+    await manager.start()
+    try:
+        await manager.register(
+            RegisterModelRequest(id="model", model_path=str(model_file))
+        )
+        await manager.start_model("model")
+        stats = await manager.stats()
+        model = stats.processes[0]
+
+        assert model.actual_memory_bytes == 3_000
+        assert model.process_memory_bytes == 1_000
+        assert model.process_file_memory_bytes == 400
+        assert model.gpu_shared_memory_bytes == 2_000
+        assert model.gpu_dedicated_memory_bytes == 500
+        assert stats.pool_usage_bytes == 3_000
+        assert stats.system.outside_pool_cache_bytes == 2_600
+        assert stats.system.outside_pool_resident_bytes == 400
+        assert (
+            stats.pool_usage_bytes
+            + stats.system.outside_pool_cache_bytes
+            + stats.system.outside_pool_resident_bytes
+            + stats.system.free_bytes
+            == stats.system.total_bytes
+        )
     finally:
         await manager.shutdown()

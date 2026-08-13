@@ -63,16 +63,18 @@
 
         <div class="memory-panel">
           <div id="memory-bar" class="memory-bar" role="img" aria-label="System memory distribution">
-            <div id="model-segments" class="model-segments"></div>
-            <div id="memory-free" class="memory-free"></div>
-            <div id="memory-other" class="memory-other"></div>
+            <div class="memory-track">
+              <div id="model-segments" class="model-segments"></div>
+              <div id="memory-free" class="memory-free"></div>
+              <div id="memory-other" class="memory-other"></div>
+            </div>
             <div id="budget-marker" class="bar-marker budget-marker hidden"><span>Pool budget</span></div>
             <div id="normal-marker" class="bar-marker normal-marker"><span>Normal headroom</span></div>
             <div id="critical-marker" class="bar-marker critical-marker"><span>Critical</span></div>
           </div>
           <div id="memory-legend" class="memory-legend"></div>
           <p class="memory-note">
-            Model segments use proportional set size (PSS), with RSS fallback. Available memory includes reclaimable cache and may overlap resident model pages.
+            Profile totals combine proportional set size (PSS, with RSS fallback) and GPU buffers resident in shared system memory. The middle region is capacity available to the pool; dedicated VRAM is reported separately and is not part of this system-memory bar.
           </p>
         </div>
       </section>

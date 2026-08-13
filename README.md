@@ -84,8 +84,9 @@ The lightweight browser panel at `/ui/` is enabled by default. It is a static,
 same-origin client of the documented pool API and has no privileged backend
 access or separate state. It provides:
 
-- An additive physical-memory bar with a segment for each loaded profile,
-  outside-pool resident/cache memory, pool-budget and headroom markers
+- A system-memory bar with a segment for each loaded profile, available
+  capacity in the middle, other non-cache system use anchored at the right,
+  and pool-budget and headroom markers
 - Live profile status, PSS/RSS usage, active request counts, priority, and
   last-used time
 - Load, force-load, unload, and unregister controls
@@ -131,10 +132,14 @@ measured PSS (or RSS fallback) immediately after initialization.
 ## Memory and eviction behavior
 
 Pool usage is the sum of the child process trees' PSS where available, falling
-back to RSS. System capacity uses available memory. Before startup, idle models
-are evicted until both normal system headroom and the optional pool budget can
-accommodate the prediction. If every eligible model is active, initialization
-waits; `force: true` permits active eviction but never bypasses a memory limit.
+back to RSS, plus DRM buffers resident in system-memory regions such as GTT.
+DRM client totals are read from Linux process `fdinfo` and deduplicated when a
+client owns multiple descriptors. Dedicated VRAM is reported separately and is
+not charged to the system-memory pool budget. System capacity uses available
+memory. Before startup, idle models are evicted until both normal system
+headroom and the optional pool budget can accommodate the prediction. If every
+eligible model is active, initialization waits; `force: true` permits active
+eviction but never bypasses a memory limit.
 
 Eviction uses the lowest numeric priority, then least-recently-used order.
 Normal pressure only evicts idle processes. Critical pressure may also stop a

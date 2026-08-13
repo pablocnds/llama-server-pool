@@ -29,6 +29,19 @@ async def test_ui_and_assets_are_served_by_default(client: httpx.AsyncClient) ->
     assert "/control/stats" in javascript.text
     assert "/control/model-files" in javascript.text
     assert "/v1/chat/completions" in javascript.text
+    assert "gpu_shared_memory_bytes" in javascript.text
+    assert "reclaimable" not in page.text.lower()
+    assert "outside_pool_cache_bytes" not in javascript.text
+    assert (
+        page.text.index('id="model-segments"')
+        < page.text.index('id="memory-free"')
+        < page.text.index('id="memory-other"')
+    )
+    assert ".memory-track" in stylesheet.text
+    assert "overflow: hidden" in stylesheet.text
+    assert javascript.text.index('$("#memory-free")') < javascript.text.index(
+        '$("#memory-other")'
+    )
 
 
 @pytest.mark.asyncio
@@ -92,4 +105,6 @@ async def test_discovery_lists_only_ggufs_resolving_inside_root(
 async def test_stats_include_additive_memory_fields(client: httpx.AsyncClient) -> None:
     stats = (await client.get("/control/stats")).json()
     assert stats["system"]["free_bytes"] >= 0
+    assert stats["system"]["cached_bytes"] >= 0
     assert stats["system"]["outside_pool_resident_bytes"] >= 0
+    assert stats["system"]["outside_pool_cache_bytes"] >= 0

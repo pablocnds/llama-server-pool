@@ -23,7 +23,7 @@ from .errors import (
     PoolShuttingDownError,
     StartupError,
 )
-from .memory import MemoryReader, SystemMemory
+from .memory import MemoryReader, ProcessMemory, SystemMemory
 from .models import (
     ModelStatus,
     ModelView,
@@ -61,6 +61,10 @@ class ModelRecord:
     internal_port: int | None = None
     api_key: str | None = None
     actual_memory_bytes: int | None = None
+    process_memory_bytes: int | None = None
+    process_file_memory_bytes: int | None = None
+    gpu_shared_memory_bytes: int | None = None
+    gpu_dedicated_memory_bytes: int | None = None
     last_error: str | None = None
     watcher: asyncio.Task[None] | None = None
     output_tasks: tuple[asyncio.Task[None], ...] = ()
@@ -319,26 +323,28 @@ class PoolManager:
         async with self._condition:
             records = list(self._records.values())
             views = [self._view(record) for record in records]
+            pool_file_memory = sum(
+                record.process_file_memory_bytes or 0 for record in records
+            )
+        free = (
+            system.free_bytes
+            if system.free_bytes is not None
+            else system.available_bytes
+        )
+        outside_cache = max(0, system.cached_bytes - pool_file_memory)
+        outside_resident = max(
+            0,
+            system.total_bytes - free - usage - outside_cache,
+        )
         return PoolStatsView(
             system=SystemMemoryView(
                 total_bytes=system.total_bytes,
                 available_bytes=system.available_bytes,
                 used_bytes=system.used_bytes,
-                free_bytes=(
-                    system.free_bytes
-                    if system.free_bytes is not None
-                    else system.available_bytes
-                ),
-                outside_pool_resident_bytes=max(
-                    0,
-                    system.total_bytes
-                    - (
-                        system.free_bytes
-                        if system.free_bytes is not None
-                        else system.available_bytes
-                    )
-                    - usage,
-                ),
+                free_bytes=free,
+                cached_bytes=system.cached_bytes,
+                outside_pool_resident_bytes=outside_resident,
+                outside_pool_cache_bytes=outside_cache,
                 normal_headroom_bytes=self.settings.normal_headroom_bytes,
                 critical_headroom_bytes=self.settings.critical_headroom_bytes,
             ),
@@ -594,7 +600,7 @@ class PoolManager:
                     actual = await self.memory.process(process.pid)
                     async with self._condition:
                         if record.process is process:
-                            record.actual_memory_bytes = actual
+                            self._set_record_memory(record, actual)
                     logger.info(
                         "initialized model %s as pid %d on internal port %d",
                         record.id,
@@ -602,10 +608,15 @@ class PoolManager:
                         port,
                     )
                     logger.debug(
-                        "model %s memory after initialization: predicted=%d actual_pss_or_rss=%d",
+                        "model %s memory after initialization: predicted=%d "
+                        "system_total=%d process_pss_or_rss=%d drm_system=%d "
+                        "drm_vram=%d",
                         record.id,
                         record.predicted_memory_bytes,
-                        actual,
+                        actual.system_bytes,
+                        actual.process_bytes,
+                        actual.drm_system_bytes,
+                        actual.drm_vram_bytes,
                     )
                     return
             except httpx.HTTPError:
@@ -661,6 +672,10 @@ class PoolManager:
                 record.watcher = None
                 record.output_tasks = ()
                 record.actual_memory_bytes = None
+                record.process_memory_bytes = None
+                record.process_file_memory_bytes = None
+                record.gpu_shared_memory_bytes = None
+                record.gpu_dedicated_memory_bytes = None
                 record.status = ModelStatus.REGISTERED
             if port is not None:
                 self._ports_in_use.discard(port)
@@ -698,6 +713,10 @@ class PoolManager:
             record.internal_port = None
             record.api_key = None
             record.actual_memory_bytes = None
+            record.process_memory_bytes = None
+            record.process_file_memory_bytes = None
+            record.gpu_shared_memory_bytes = None
+            record.gpu_dedicated_memory_bytes = None
             self._ports_in_use.discard(port)
             if self._closing:
                 record.status = ModelStatus.REGISTERED
@@ -787,8 +806,8 @@ class PoolManager:
         async with self._condition:
             for (record, process), usage in zip(process_records, usages, strict=True):
                 if record.process is process:
-                    record.actual_memory_bytes = usage
-                    total += usage
+                    self._set_record_memory(record, usage)
+                    total += usage.system_bytes
         return total
 
     async def _refresh_record_memory(self, record: ModelRecord) -> None:
@@ -799,7 +818,15 @@ class PoolManager:
         usage = await self.memory.process(process.pid)
         async with self._condition:
             if record.process is process:
-                record.actual_memory_bytes = usage
+                self._set_record_memory(record, usage)
+
+    @staticmethod
+    def _set_record_memory(record: ModelRecord, usage: ProcessMemory) -> None:
+        record.actual_memory_bytes = usage.system_bytes
+        record.process_memory_bytes = usage.process_bytes
+        record.process_file_memory_bytes = usage.process_file_bytes
+        record.gpu_shared_memory_bytes = usage.drm_system_bytes
+        record.gpu_dedicated_memory_bytes = usage.drm_vram_bytes
 
     async def _allocate_port(self) -> int | None:
         count = self.settings.internal_port_max - self.settings.internal_port_min + 1
@@ -863,5 +890,9 @@ class PoolManager:
             internal_port=record.internal_port,
             predicted_memory_bytes=record.predicted_memory_bytes,
             actual_memory_bytes=record.actual_memory_bytes,
+            process_memory_bytes=record.process_memory_bytes,
+            process_file_memory_bytes=record.process_file_memory_bytes,
+            gpu_shared_memory_bytes=record.gpu_shared_memory_bytes,
+            gpu_dedicated_memory_bytes=record.gpu_dedicated_memory_bytes,
             last_error=record.last_error,
         )

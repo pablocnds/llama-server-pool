@@ -50,6 +50,10 @@ class ModelView(BaseModel):
     internal_port: int | None
     predicted_memory_bytes: int
     actual_memory_bytes: int | None
+    process_memory_bytes: int | None
+    process_file_memory_bytes: int | None
+    gpu_shared_memory_bytes: int | None
+    gpu_dedicated_memory_bytes: int | None
     last_error: str | None
 
 
@@ -58,7 +62,9 @@ class SystemMemoryView(BaseModel):
     available_bytes: int
     used_bytes: int
     free_bytes: int
+    cached_bytes: int
     outside_pool_resident_bytes: int
+    outside_pool_cache_bytes: int
     normal_headroom_bytes: int
     critical_headroom_bytes: int
 

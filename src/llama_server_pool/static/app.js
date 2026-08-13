@@ -101,26 +101,27 @@ function renderMemoryBar() {
     segment.className = "model-segment";
     segment.style.width = `${Math.max(0, profile.actual_memory_bytes / Math.max(poolUsage, 1) * 100)}%`;
     segment.style.background = color;
-    segment.title = `${profile.id}: ${formatBytes(profile.actual_memory_bytes)}`;
+    segment.title = memoryBreakdown(profile);
     modelContainer.append(segment);
     legend.append(legendItem(color, profile.id, formatBytes(profile.actual_memory_bytes)));
   });
   modelContainer.style.width = `${Math.min(100, poolUsage / total * 100)}%`;
 
-  const outside = Math.min(system.outside_pool_resident_bytes, Math.max(0, total - poolUsage));
-  const unassigned = Math.max(0, total - poolUsage - outside);
-  $("#memory-free").style.width = `${unassigned / total * 100}%`;
+  const outside = Math.max(0, system.outside_pool_resident_bytes);
+  const availableCapacity = Math.max(0, total - poolUsage - outside);
+  $("#memory-free").style.width = `${availableCapacity / total * 100}%`;
   $("#memory-other").style.width = `${outside / total * 100}%`;
-  $("#memory-other").title = `Outside pool resident/cache: ${formatBytes(outside)}`;
-  legend.append(legendItem("#59616d", "Outside pool", formatBytes(outside)));
-  legend.append(legendItem("#151a20", "Physically free", formatBytes(system.free_bytes)));
+  $("#memory-other").title = `Other system use: ${formatBytes(outside)}`;
+  $("#memory-free").title = `Available capacity: ${formatBytes(availableCapacity)}`;
+  legend.append(legendItem("#59616d", "Other system use", formatBytes(outside)));
+  legend.append(legendItem("#151a20", "Available capacity", formatBytes(availableCapacity)));
 
   placeMarker("#budget-marker", budget ? budget / total : null);
   placeMarker("#normal-marker", (total - system.normal_headroom_bytes) / total);
   placeMarker("#critical-marker", (total - system.critical_headroom_bytes) / total);
   $("#memory-bar").setAttribute(
     "aria-label",
-    `Pool ${formatBytes(poolUsage)}, outside pool ${formatBytes(outside)}, physically free ${formatBytes(system.free_bytes)}, available ${formatBytes(system.available_bytes)}`,
+    `Pool ${formatBytes(poolUsage)}, available capacity ${formatBytes(availableCapacity)}, other system use ${formatBytes(outside)}, system available ${formatBytes(system.available_bytes)}`,
   );
 }
 
@@ -191,11 +192,9 @@ function profileCard(profile) {
   path.textContent = profile.model_path;
   identity.append(titleRow, path);
 
-  card.append(
-    identity,
-    profileStat("Memory", memory, activeText, profile.active_requests > 0),
-    profileStat("Eviction", `Priority ${profile.priority}`, lastUsed),
-  );
+  const memoryStat = profileStat("Memory", memory, activeText, profile.active_requests > 0);
+  memoryStat.title = memoryBreakdown(profile);
+  card.append(identity, memoryStat, profileStat("Eviction", `Priority ${profile.priority}`, lastUsed));
 
   const actions = document.createElement("div");
   actions.className = "profile-actions";
@@ -569,6 +568,17 @@ function formatBytes(bytes) {
   const index = Math.min(Math.floor(Math.log(Math.abs(bytes)) / Math.log(1024)), units.length - 1);
   const value = bytes / 1024 ** index;
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
+function memoryBreakdown(profile) {
+  if (!profile.actual_memory_bytes) return `${profile.id}: ${formatBytes(profile.predicted_memory_bytes)} predicted`;
+  const parts = [
+    `${profile.id}: ${formatBytes(profile.actual_memory_bytes)} system RAM`,
+    `${formatBytes(profile.process_memory_bytes)} process PSS/RSS`,
+  ];
+  if (profile.gpu_shared_memory_bytes) parts.push(`${formatBytes(profile.gpu_shared_memory_bytes)} GPU shared system memory`);
+  if (profile.gpu_dedicated_memory_bytes) parts.push(`${formatBytes(profile.gpu_dedicated_memory_bytes)} dedicated VRAM`);
+  return parts.join(" · ");
 }
 
 function modelColor(modelId) {
