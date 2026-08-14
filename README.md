@@ -125,6 +125,7 @@ Configuration uses environment variables. Byte values are integer byte counts.
 | `LLAMA_POOL_LOG_LEVEL` | `INFO` |
 | `LLAMA_POOL_UI_ENABLED` | `true` |
 | `LLAMA_POOL_MODEL_DISCOVERY_ROOT` | unset (discovery disabled) |
+| `LLAMA_POOL_PROFILES_FILE` | `$XDG_CONFIG_HOME/llama-server-pool/profiles.json` or `~/.config/llama-server-pool/profiles.json` |
 
 Set the log level to `DEBUG` to record each model's predicted memory and its
 measured PSS (or RSS fallback) immediately after initialization.
@@ -146,9 +147,8 @@ Normal pressure only evicts idle processes. Critical pressure may also stop a
 starting or active process to protect the host. Forced or critical eviction of
 an active process interrupts its in-flight response or stream.
 
-The pool terminates every managed process group during shutdown. Registrations
-are intentionally not persisted in this MVP, and VRAM accounting is not yet
-implemented.
+The pool terminates every managed process group during shutdown. VRAM
+accounting is not yet implemented.
 
 ## Tests
 

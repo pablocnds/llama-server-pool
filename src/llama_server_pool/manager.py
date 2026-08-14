@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
 import signal
 import socket
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,6 +23,7 @@ from .errors import (
     ModelConflictError,
     ModelNotFoundError,
     PoolShuttingDownError,
+    ProfileStoreError,
     StartupError,
 )
 from .memory import MemoryReader, ProcessMemory, SystemMemory
@@ -28,7 +31,9 @@ from .models import (
     ModelStatus,
     ModelView,
     PoolStatsView,
+    ProfileStore,
     RegisterModelRequest,
+    StoredProfile,
     SystemMemoryView,
 )
 
@@ -62,6 +67,7 @@ class ModelRecord:
     args: tuple[str, ...]
     priority: int
     predicted_memory_bytes: int
+    estimated_memory_bytes: int | None = None
     created_at: float = field(default_factory=time.time)
     status: ModelStatus = ModelStatus.REGISTERED
     active_requests: int = 0
@@ -127,6 +133,7 @@ class PoolManager:
         )
 
     async def start(self) -> None:
+        await self._load_profiles()
         self._monitor_task = asyncio.create_task(
             self._monitor_loop(), name="memory-monitor"
         )
@@ -192,9 +199,17 @@ class PoolManager:
                 args=tuple(request.args),
                 priority=request.priority,
                 predicted_memory_bytes=prediction,
+                estimated_memory_bytes=request.estimated_memory_bytes,
             )
             self._records[record.id] = record
-            self._condition.notify_all()
+            try:
+                await self._persist_profiles_locked()
+            except Exception:
+                del self._records[record.id]
+                self._condition.notify_all()
+                raise
+            else:
+                self._condition.notify_all()
 
         logger.info("registered model %s from %s", record.id, record.model_path)
         logger.debug(
@@ -213,7 +228,14 @@ class PoolManager:
         async with self._condition:
             if self._records.get(model_id) is record:
                 del self._records[model_id]
-                self._condition.notify_all()
+                try:
+                    await self._persist_profiles_locked()
+                except Exception:
+                    self._records[model_id] = record
+                    self._condition.notify_all()
+                    raise
+                else:
+                    self._condition.notify_all()
         logger.info("removed model registration %s", model_id)
 
     async def unload(self, model_id: str) -> ModelView:
@@ -226,8 +248,16 @@ class PoolManager:
             record = self._records.get(model_id)
             if record is None:
                 raise ModelNotFoundError(f"model {model_id!r} is not registered")
+            old_priority = record.priority
             record.priority = priority
-            self._condition.notify_all()
+            try:
+                await self._persist_profiles_locked()
+            except Exception:
+                record.priority = old_priority
+                self._condition.notify_all()
+                raise
+            else:
+                self._condition.notify_all()
         return self._view(record)
 
     async def start_model(self, model_id: str, *, force: bool = False) -> ModelView:
@@ -905,6 +935,125 @@ class PoolManager:
         record.process_file_memory_bytes = usage.process_file_bytes
         record.gpu_shared_memory_bytes = usage.drm_system_bytes
         record.gpu_dedicated_memory_bytes = usage.drm_vram_bytes
+
+    async def _load_profiles(self) -> None:
+        if self.settings.profiles_file is None:
+            return
+        path = Path(self.settings.profiles_file)
+        try:
+            contents = await asyncio.to_thread(path.read_text, encoding="utf-8")
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ProfileStoreError(
+                f"could not read profiles file {path}: {exc}"
+            ) from exc
+        try:
+            store = ProfileStore.model_validate_json(contents)
+        except ValueError as exc:
+            raise ProfileStoreError(f"profiles file {path} is invalid: {exc}") from exc
+
+        records: dict[str, ModelRecord] = {}
+        identities: dict[tuple[str, tuple[str, ...]], str] = {}
+        for profile in store.profiles:
+            self._validate_args(profile.args)
+            try:
+                model_path = Path(profile.model_path).expanduser().resolve(strict=True)
+            except OSError as exc:
+                raise ProfileStoreError(
+                    f"model path for stored profile {profile.id!r} cannot be accessed: "
+                    f"{profile.model_path}"
+                ) from exc
+            if not model_path.is_file():
+                raise ProfileStoreError(
+                    f"model path for stored profile {profile.id!r} is not a regular "
+                    f"file: {model_path}"
+                )
+            if profile.id in records:
+                raise ProfileStoreError(
+                    f"profiles file contains duplicate model ID {profile.id!r}"
+                )
+            identity = (str(model_path), tuple(profile.args))
+            duplicate_id = identities.get(identity)
+            if duplicate_id is not None:
+                raise ProfileStoreError(
+                    f"stored profiles {duplicate_id!r} and {profile.id!r} use the "
+                    "same model path and arguments"
+                )
+            prediction = profile.estimated_memory_bytes
+            if prediction is None:
+                prediction = (
+                    model_path.stat().st_size + self.settings.model_size_margin_bytes
+                )
+            records[profile.id] = ModelRecord(
+                id=profile.id,
+                model_path=str(model_path),
+                args=tuple(profile.args),
+                priority=profile.priority,
+                predicted_memory_bytes=prediction,
+                estimated_memory_bytes=profile.estimated_memory_bytes,
+            )
+            identities[identity] = profile.id
+
+        async with self._condition:
+            self._records.update(records)
+            self._condition.notify_all()
+        if records:
+            logger.info("loaded %d stored model profiles from %s", len(records), path)
+
+    async def _persist_profiles_locked(self) -> None:
+        if self.settings.profiles_file is None:
+            return
+        path = Path(self.settings.profiles_file)
+        store = ProfileStore(
+            profiles=[
+                StoredProfile(
+                    id=record.id,
+                    model_path=record.model_path,
+                    args=list(record.args),
+                    priority=record.priority,
+                    estimated_memory_bytes=record.estimated_memory_bytes,
+                )
+                for record in self._records.values()
+            ]
+        )
+        contents = json.dumps(store.model_dump(mode="json"), indent=2) + "\n"
+        task = asyncio.create_task(
+            asyncio.to_thread(self._write_profiles_file, path, contents)
+        )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+        except OSError as exc:
+            raise ProfileStoreError(
+                f"could not write profiles file {path}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _write_profiles_file(path: Path, contents: str) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", text=True
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+                destination.write(contents)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary_path, path)
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_descriptor = os.open(path.parent, directory_flags)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary_path.unlink()
 
     async def _allocate_port(self) -> int | None:
         count = self.settings.internal_port_max - self.settings.internal_port_min + 1

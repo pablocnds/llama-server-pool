@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -23,6 +24,23 @@ class RegisterModelRequest(BaseModel):
     initialize: bool = False
     force: bool = False
     estimated_memory_bytes: int | None = Field(default=None, gt=0)
+
+
+class StoredProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9._:-]+$")
+    model_path: str = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    priority: int = 0
+    estimated_memory_bytes: int | None = Field(default=None, gt=0)
+
+
+class ProfileStore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    profiles: list[StoredProfile] = Field(default_factory=list)
 
 
 class StartModelRequest(BaseModel):

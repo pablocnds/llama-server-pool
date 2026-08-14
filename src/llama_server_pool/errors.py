@@ -35,3 +35,8 @@ class StartupError(PoolError):
 class PoolShuttingDownError(PoolError):
     status_code = 503
     code = "pool_shutting_down"
+
+
+class ProfileStoreError(PoolError):
+    status_code = 500
+    code = "profile_store_error"

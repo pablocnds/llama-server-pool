@@ -30,3 +30,25 @@ def test_invalid_ui_boolean_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None
 def test_missing_discovery_root_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot be accessed"):
         Settings(model_discovery_root=str(tmp_path / "missing"))
+
+
+def test_profiles_file_defaults_to_xdg_config_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("LLAMA_POOL_PROFILES_FILE", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.profiles_file == str(
+        (tmp_path / "llama-server-pool" / "profiles.json").resolve()
+    )
+
+
+def test_profiles_file_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "shared" / "models.json"
+    monkeypatch.setenv("LLAMA_POOL_PROFILES_FILE", str(path))
+
+    assert Settings.from_env().profiles_file == str(path.resolve())

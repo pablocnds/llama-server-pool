@@ -66,8 +66,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         app.state.manager = manager
         app.state.proxy_client = proxy_client
-        await manager.start()
         try:
+            await manager.start()
             yield
         finally:
             await proxy_client.aclose()

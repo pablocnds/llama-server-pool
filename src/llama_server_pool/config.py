@@ -30,6 +30,12 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _default_profiles_file() -> Path:
+    config_home = os.getenv("XDG_CONFIG_HOME")
+    root = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return root / "llama-server-pool" / "profiles.json"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     host: str = "127.0.0.1"
@@ -47,6 +53,7 @@ class Settings:
     log_level: str = "INFO"
     ui_enabled: bool = True
     model_discovery_root: str | None = None
+    profiles_file: str | None = None
 
     def __post_init__(self) -> None:
         if not 0 < self.port <= 65_535:
@@ -79,6 +86,11 @@ class Settings:
             if not root.is_dir():
                 raise ValueError("model discovery root must be a directory")
             object.__setattr__(self, "model_discovery_root", str(root))
+        if self.profiles_file is not None:
+            profiles_file = Path(self.profiles_file).expanduser().resolve()
+            if profiles_file.exists() and not profiles_file.is_file():
+                raise ValueError("profiles file must be a regular file")
+            object.__setattr__(self, "profiles_file", str(profiles_file))
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -111,4 +123,6 @@ class Settings:
             log_level=os.getenv("LLAMA_POOL_LOG_LEVEL", "INFO"),
             ui_enabled=_env_bool("LLAMA_POOL_UI_ENABLED", True),
             model_discovery_root=os.getenv("LLAMA_POOL_MODEL_DISCOVERY_ROOT") or None,
+            profiles_file=os.getenv("LLAMA_POOL_PROFILES_FILE")
+            or str(_default_profiles_file()),
         )

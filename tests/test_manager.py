@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import sys
 from dataclasses import replace
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from llama_server_pool.config import Settings
-from llama_server_pool.errors import ModelConflictError, StartupError
+from llama_server_pool.errors import ModelConflictError, ProfileStoreError, StartupError
 from llama_server_pool.manager import PoolManager
 from llama_server_pool.memory import ProcessMemory, SystemMemory
 from llama_server_pool.models import RegisterModelRequest
@@ -546,5 +547,113 @@ async def test_stats_charge_drm_system_memory_and_separate_cache(
             + stats.system.free_bytes
             == stats.system.total_bytes
         )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_profiles_persist_across_manager_instances(
+    model_file: Path, tmp_path: Path
+) -> None:
+    profiles_file = tmp_path / "config" / "profiles.json"
+    settings = replace(manager_settings(), profiles_file=str(profiles_file))
+    first = PoolManager(settings, memory_reader=FixedMemoryReader())
+    await first.start()
+    try:
+        await first.register(
+            RegisterModelRequest(
+                id="persistent",
+                model_path=str(model_file),
+                args=["--ctx-size", "4096"],
+                priority=3,
+                estimated_memory_bytes=321,
+            )
+        )
+        await first.update_priority("persistent", 7)
+        await first.start_model("persistent")
+    finally:
+        await first.shutdown()
+
+    stored = json.loads(profiles_file.read_text())
+    assert stored == {
+        "version": 1,
+        "profiles": [
+            {
+                "id": "persistent",
+                "model_path": str(model_file.resolve()),
+                "args": ["--ctx-size", "4096"],
+                "priority": 7,
+                "estimated_memory_bytes": 321,
+            }
+        ],
+    }
+    assert profiles_file.stat().st_mode & 0o777 == 0o600
+
+    second = PoolManager(settings, memory_reader=FixedMemoryReader())
+    await second.start()
+    try:
+        restored = await second.get_model("persistent")
+        assert restored.status == "registered"
+        assert restored.pid is None
+        assert restored.priority == 7
+        assert restored.predicted_memory_bytes == 321
+    finally:
+        await second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_removing_a_profile_updates_the_store(
+    model_file: Path, tmp_path: Path
+) -> None:
+    profiles_file = tmp_path / "profiles.json"
+    settings = replace(manager_settings(), profiles_file=str(profiles_file))
+    manager = PoolManager(settings, memory_reader=FixedMemoryReader())
+    await manager.start()
+    try:
+        await manager.register(
+            RegisterModelRequest(id="temporary", model_path=str(model_file))
+        )
+        await manager.remove("temporary")
+    finally:
+        await manager.shutdown()
+
+    assert json.loads(profiles_file.read_text()) == {"version": 1, "profiles": []}
+
+
+@pytest.mark.asyncio
+async def test_invalid_profile_store_fails_startup(tmp_path: Path) -> None:
+    profiles_file = tmp_path / "profiles.json"
+    profiles_file.write_text('{"version": 99, "profiles": []}')
+    manager = PoolManager(
+        replace(manager_settings(), profiles_file=str(profiles_file)),
+        memory_reader=FixedMemoryReader(),
+    )
+
+    with pytest.raises(ProfileStoreError, match="is invalid"):
+        await manager.start()
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_profile_write_rolls_back_registration(
+    model_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profiles_file = tmp_path / "profiles.json"
+    manager = PoolManager(
+        replace(manager_settings(), profiles_file=str(profiles_file)),
+        memory_reader=FixedMemoryReader(),
+    )
+    await manager.start()
+    try:
+
+        def fail_write(_path, _contents):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(manager, "_write_profiles_file", fail_write)
+        with pytest.raises(ProfileStoreError, match="could not write"):
+            await manager.register(
+                RegisterModelRequest(id="rollback", model_path=str(model_file))
+            )
+        assert await manager.list_models() == []
     finally:
         await manager.shutdown()
