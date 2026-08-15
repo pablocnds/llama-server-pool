@@ -6,8 +6,11 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Iterable
 from contextlib import asynccontextmanager
+from email.parser import BytesParser
+from email.policy import default as default_email_policy
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, Request
@@ -51,8 +54,10 @@ _REQUEST_HEADERS_TO_DROP = _HOP_BY_HOP_HEADERS | {
     "authorization",
     "content-length",
     "host",
+    "x-api-key",
 }
 _RESPONSE_HEADERS_TO_DROP = _HOP_BY_HOP_HEADERS | {"content-length"}
+_POOL_PATH_PREFIXES = {"control", "docs", "redoc", "ui"}
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -155,79 +160,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ],
         }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request) -> Response:
-        raw_body = await request.body()
-        try:
-            body = json.loads(raw_body)
-        except json.JSONDecodeError, UnicodeDecodeError:
-            return _error_response(
-                400, "request body must be valid JSON", "invalid_request"
-            )
-        if not isinstance(body, dict) or not isinstance(body.get("model"), str):
-            return _error_response(
-                400, "request body must contain a string model field", "invalid_request"
-            )
-
-        manager = _manager(request)
-        lease = await _await_or_disconnect(
-            request, manager.acquire_route(body["model"])
-        )
-        proxy_client: httpx.AsyncClient = request.app.state.proxy_client
-        headers = _filtered_headers(
-            (
-                (key.decode("latin-1"), value.decode("latin-1"))
-                for key, value in request.headers.raw
-            ),
-            _REQUEST_HEADERS_TO_DROP,
-        )
-        headers.append(("Authorization", f"Bearer {lease.api_key}"))
-        upstream_request = proxy_client.build_request(
-            "POST",
-            f"http://127.0.0.1:{lease.port}/v1/chat/completions",
-            headers=headers,
-            content=raw_body,
-        )
-        try:
-            upstream = await proxy_client.send(upstream_request, stream=True)
-        except httpx.HTTPError as exc:
-            await lease.release()
-            logger.warning(
-                "proxy connection to model %s failed: %s", body["model"], exc
-            )
-            return _error_response(
-                502, "the model server is unavailable", "upstream_error"
-            )
-
-        response_headers = _filtered_headers(
-            upstream.headers.multi_items(), _RESPONSE_HEADERS_TO_DROP
-        )
-        if body.get("stream") is True:
-            return _append_response_headers(
-                StreamingResponse(
-                    _stream_upstream(upstream, lease),
-                    status_code=upstream.status_code,
-                    media_type=None,
-                ),
-                response_headers,
-            )
-
-        try:
-            content = b"".join([chunk async for chunk in upstream.aiter_raw()])
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "proxy response from model %s failed: %s", body["model"], exc
-            )
-            return _error_response(
-                502, "the model server disconnected", "upstream_error"
-            )
-        finally:
-            await upstream.aclose()
-            await lease.release()
-        return _append_response_headers(
-            Response(content=content, status_code=upstream.status_code),
-            response_headers,
-        )
+    @app.get("/health")
+    @app.get("/v1/health")
+    async def health() -> dict[str, str]:
+        # llama-server's router health is also about the router itself rather
+        # than any particular (possibly unloaded) model.
+        return {"status": "ok"}
 
     if configured.ui_enabled:
         static_directory = Path(__file__).with_name("static")
@@ -242,7 +180,93 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             name="ui",
         )
 
+    @app.api_route(
+        "/{upstream_path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        include_in_schema=False,
+    )
+    async def llama_server_proxy(upstream_path: str, request: Request) -> Response:
+        """Forward model-scoped llama-server APIs without recreating schemas."""
+        if upstream_path.partition("/")[0] in _POOL_PATH_PREFIXES:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        raw_body = await request.body()
+        model_id = _request_model(request, raw_body)
+        if model_id is None:
+            return _error_response(
+                400,
+                "request must identify a model using a string model field or "
+                "the model query parameter",
+                "invalid_request",
+            )
+        return await _proxy_model_request(request, upstream_path, raw_body, model_id)
+
     return app
+
+
+async def _proxy_model_request(
+    request: Request, upstream_path: str, raw_body: bytes, model_id: str
+) -> Response:
+    lease = await _await_or_disconnect(
+        request, _manager(request).acquire_route(model_id)
+    )
+    proxy_client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _filtered_headers(
+        (
+            (key.decode("latin-1"), value.decode("latin-1"))
+            for key, value in request.headers.raw
+        ),
+        _REQUEST_HEADERS_TO_DROP,
+    )
+    headers.append(("Authorization", f"Bearer {lease.api_key}"))
+    headers.append(("X-Api-Key", lease.api_key))
+    target = f"http://127.0.0.1:{lease.port}/{upstream_path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    try:
+        upstream_request = proxy_client.build_request(
+            request.method,
+            target,
+            headers=headers,
+            content=raw_body,
+        )
+        upstream = await proxy_client.send(upstream_request, stream=True)
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        await lease.release()
+        logger.warning("proxy connection to model %s failed: %s", model_id, exc)
+        return _error_response(
+            502, "the model server is unavailable", "upstream_error"
+        )
+
+    response_headers = _filtered_headers(
+        upstream.headers.multi_items(), _RESPONSE_HEADERS_TO_DROP
+    )
+    response_media_type = (
+        upstream.headers.get("content-type", "").partition(";")[0].strip().lower()
+    )
+    if response_media_type == "text/event-stream":
+        return _append_response_headers(
+            StreamingResponse(
+                _stream_upstream(upstream, lease),
+                status_code=upstream.status_code,
+                media_type=None,
+            ),
+            response_headers,
+        )
+
+    try:
+        content = b"".join([chunk async for chunk in upstream.aiter_raw()])
+    except httpx.HTTPError as exc:
+        logger.warning("proxy response from model %s failed: %s", model_id, exc)
+        return _error_response(
+            502, "the model server disconnected", "upstream_error"
+        )
+    finally:
+        await upstream.aclose()
+        await lease.release()
+    return _append_response_headers(
+        Response(content=content, status_code=upstream.status_code),
+        response_headers,
+    )
 
 
 async def _stream_upstream(
@@ -260,6 +284,59 @@ async def _stream_upstream(
 
 def _manager(request: Request) -> PoolManager:
     return request.app.state.manager
+
+
+def _request_model(request: Request, raw_body: bytes) -> str | None:
+    """Read only the routing key while leaving the forwarded body untouched."""
+    query_model = request.query_params.get("model")
+    if query_model:
+        return query_model
+
+    content_type = request.headers.get("content-type", "")
+    media_type = content_type.partition(";")[0].strip().lower()
+    if media_type == "application/x-www-form-urlencoded":
+        try:
+            form_model = parse_qs(raw_body.decode("utf-8")).get("model", [None])[0]
+        except UnicodeDecodeError:
+            return None
+        return form_model or None
+
+    if media_type == "multipart/form-data":
+        return _multipart_model(content_type, raw_body)
+
+    try:
+        body = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    body_model = body.get("model") if isinstance(body, dict) else None
+    return body_model if isinstance(body_model, str) and body_model else None
+
+
+def _multipart_model(content_type: str, raw_body: bytes) -> str | None:
+    # The standard-library MIME parser is sufficient here: the body itself is
+    # still passed byte-for-byte to llama-server, and only the small routing
+    # field is decoded.
+    safe_content_type = content_type.splitlines()[0]
+    message = BytesParser(policy=default_email_policy).parsebytes(
+        b"Content-Type: "
+        + safe_content_type.encode("latin-1")
+        + b"\r\nMIME-Version: 1.0\r\n\r\n"
+        + raw_body
+    )
+    if not message.is_multipart():
+        return None
+    for part in message.iter_parts():
+        if part.get_param("name", header="content-disposition") != "model":
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return None
+        try:
+            model = payload.decode(part.get_content_charset() or "utf-8").strip()
+        except (LookupError, UnicodeDecodeError):
+            return None
+        return model or None
+    return None
 
 
 async def _await_or_disconnect[T](request: Request, operation: Awaitable[T]) -> T:

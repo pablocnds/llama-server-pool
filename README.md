@@ -48,8 +48,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen-16k","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Both regular and streaming chat completions are supported. Requesting an
-unloaded registered model starts it automatically.
+Requests are forwarded unchanged, including streaming and llama-server-specific
+options. Requesting an unloaded registered model starts it automatically.
 
 ## API
 
@@ -65,7 +65,8 @@ unloaded registered model starts it automatically.
 | `GET` | `/control/stats` | Get system, pool, and per-process memory data |
 | `GET` | `/control/model-files` | List GGUF files inside the optional discovery root |
 | `GET` | `/v1/models` | List all registered stable model IDs |
-| `POST` | `/v1/chat/completions` | Proxy an OpenAI-compatible request |
+| `GET` | `/health`, `/v1/health` | Check pool readiness without loading a model |
+| Any | Any other llama-server path | Transparently proxy a model-scoped request |
 
 Registration requires `id` and `model_path`. `args` defaults to an empty array,
 and `priority` defaults to zero. Lower numeric priorities are evicted first.
@@ -77,6 +78,10 @@ The pool owns the llama-server `--model`, `--alias`, `--host`, `--port`,
 `--api-key`, and `--api-key-file` options. Supplying any of those through
 registration arguments is rejected. Duplicate registrations with the same
 resolved model path and exact argument list return HTTP 409.
+
+Model-scoped llama-server endpoints are proxied without maintaining separate
+request schemas. Use the JSON `model` field, or `?model=<profile-id>` when the
+body has no top-level model field.
 
 ## Monitoring and control panel
 

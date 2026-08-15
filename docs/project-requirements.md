@@ -8,7 +8,7 @@
 
 - Other API requests include getting stats like memory usage, individual process memory usage, etc.
 
-- The service hosts an OpenAI-compatible endpoint and routes the requests to each corresponding llama-server subprocess according to the stable model ID. Initially it supports `/v1/chat/completions`, including streaming, and `/v1/models`; more endpoints may be added later. Each subprocess is hosted on its own internal port on 127.0.0.1 and protected by a manager-generated API key, as it is meant to communicate only through the pool. By default, this pool is also hosted on localhost, unless otherwise specified.
+- The service hosts a transparent OpenAI-compatible and native llama-server proxy and routes model-scoped requests to each corresponding subprocess according to the stable model ID. It extracts only the routing model, forwards request and response data without maintaining duplicate endpoint schemas, and supports streaming on every proxied path. Pool-wide `/v1/models` and health endpoints are handled by the pool itself. Each subprocess is hosted on its own internal port on 127.0.0.1 and protected by a manager-generated API key, as it is meant to communicate only through the pool. By default, this pool is also hosted on localhost, unless otherwise specified.
 
 - Subprocess ports are dynamically allocated from a configurable range and are not part of a model's public identity. A port can be reused after its previous process has exited, and port conflicts are retried with another port.
 

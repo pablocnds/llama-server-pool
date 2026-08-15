@@ -25,12 +25,17 @@ async def test_register_start_proxy_unload_and_lazy_restart(
     assert first["status"] == "running"
     assert first["pid"] is not None
 
-    response = await client.post(
-        "/v1/chat/completions",
-        json={"model": "qwen-test", "messages": [{"role": "user", "content": "hi"}]},
-    )
+    chat_request = {
+        "model": "qwen-test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.4,
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+    response = await client.post("/v1/chat/completions", json=chat_request)
     assert response.status_code == 200
     assert response.json()["model"] == "qwen-test"
+    assert response.json()["request"] == chat_request
 
     models = await client.get("/v1/models")
     assert [item["id"] for item in models.json()["data"]] == ["qwen-test"]
@@ -70,6 +75,129 @@ async def test_streaming_proxy(client: httpx.AsyncClient, model_file) -> None:
     model = await client.get("/control/models/streamer")
     assert model.json()["active_requests"] == 0
     assert model.json()["last_used_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_health_is_pool_scoped_and_does_not_load_models(
+    client: httpx.AsyncClient, model_file
+) -> None:
+    await client.post(
+        "/control/models", json={"id": "healthy", "model_path": str(model_file)}
+    )
+
+    for path in ("/health", "/v1/health"):
+        response = await client.get(path)
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+    model = await client.get("/control/models/healthy")
+    assert model.json()["status"] == "registered"
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_llama_server_paths_and_request_options_are_forwarded(
+    client: httpx.AsyncClient, model_file
+) -> None:
+    await client.post(
+        "/control/models", json={"id": "forwarded", "model_path": str(model_file)}
+    )
+    body = {
+        "model": "forwarded",
+        "input": "hello",
+        "temperature": 0.37,
+        "top_p": 0.81,
+        "reasoning_effort": "high",
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "custom_template_value": "untouched",
+        },
+        "future_llama_option": {"nested": [1, 2, 3]},
+    }
+
+    response = await client.post("/v1/responses?custom=query", json=body)
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["path"] == "/v1/responses?custom=query"
+    assert result["request"] == body
+
+
+@pytest.mark.asyncio
+async def test_client_credentials_are_replaced_with_internal_credentials(
+    client: httpx.AsyncClient, model_file
+) -> None:
+    await client.post(
+        "/control/models", json={"id": "anthropic", "model_path": str(model_file)}
+    )
+
+    response = await client.post(
+        "/v1/messages",
+        headers={"Authorization": "Bearer external", "X-Api-Key": "external"},
+        json={"model": "anthropic", "messages": [], "max_tokens": 10},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["authorization"].startswith("Bearer pool_")
+    assert result["x_api_key"] == result["authorization"].removeprefix("Bearer ")
+
+
+@pytest.mark.asyncio
+async def test_query_model_routes_bodies_without_a_model_field(
+    client: httpx.AsyncClient, model_file
+) -> None:
+    await client.post(
+        "/control/models", json={"id": "utility", "model_path": str(model_file)}
+    )
+
+    tokenized = await client.post(
+        "/tokenize?model=utility&trace=yes",
+        json={"content": "hello", "with_pieces": True},
+    )
+    assert tokenized.status_code == 200
+    assert tokenized.json()["path"] == "/tokenize?model=utility&trace=yes"
+    assert tokenized.json()["request"] == {
+        "content": "hello",
+        "with_pieces": True,
+    }
+
+    props = await client.get("/props?model=utility&detail=full")
+    assert props.status_code == 200
+    assert props.json() == {
+        "path": "/props?model=utility&detail=full",
+        "method": "GET",
+    }
+
+
+@pytest.mark.asyncio
+async def test_multipart_model_field_routes_and_preserves_upload(
+    client: httpx.AsyncClient, model_file
+) -> None:
+    await client.post(
+        "/control/models", json={"id": "audio", "model_path": str(model_file)}
+    )
+
+    response = await client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "audio", "language": "en"},
+        files={"file": ("sample.wav", b"fake-wave-data", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["path"] == "/v1/audio/transcriptions"
+    assert "multipart/form-data" in result["request"]["content_type"]
+    assert 'name="model"' in result["request"]["raw_body"]
+    assert "fake-wave-data" in result["request"]["raw_body"]
+
+
+@pytest.mark.asyncio
+async def test_model_is_required_for_model_scoped_proxy_requests(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await client.post("/v1/responses", json={"input": "hello"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 @pytest.mark.asyncio

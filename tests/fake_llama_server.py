@@ -30,10 +30,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self.send_error(401)
             return
-        if self.path != "/health":
+        if self.path in {"/health", "/v1/health"}:
+            body = b'{"status":"ok"}'
+        elif self.path.startswith("/props?") or self.path.startswith("/slots?"):
+            body = json.dumps({"path": self.path, "method": "GET"}).encode()
+        else:
             self.send_error(404)
             return
-        body = b'{"status":"ok"}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -44,11 +47,15 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self.send_error(401)
             return
-        if self.path != "/v1/chat/completions":
-            self.send_error(404)
-            return
         length = int(self.headers.get("Content-Length", "0"))
-        request = json.loads(self.rfile.read(length))
+        raw_body = self.rfile.read(length)
+        if self.headers.get_content_type() == "application/json":
+            request = json.loads(raw_body)
+        else:
+            request = {
+                "content_type": self.headers.get("Content-Type"),
+                "raw_body": raw_body.decode("latin-1"),
+            }
         if request.get("stream") is True:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -74,6 +81,10 @@ class Handler(BaseHTTPRequestHandler):
                 "id": "fake-completion",
                 "object": "chat.completion",
                 "model": options.alias,
+                "path": self.path,
+                "request": request,
+                "authorization": self.headers.get("Authorization"),
+                "x_api_key": self.headers.get("X-Api-Key"),
                 "choices": [
                     {
                         "index": 0,
